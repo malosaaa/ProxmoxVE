@@ -25,7 +25,7 @@ CT_TYPE="debian"
 CT_OS_TYPE="debian"
 CT_OS_VERSION="12" # Debian Bookworm
 CT_ARCHITECTURE="amd64"
-CT_TEMPLATE_URL="https://download.proxmox.com/images/rootfs/${CT_OS_TYPE}-bookworm-standard_12.0-1_amd64.tar.zst"
+CT_TEMPLATE_URL="https://download.proxmox.com/images/rootfs/${CT_OS_TYPE}-bookworm-standard_12.0-1_${CT_ARCHITECTURE}.tar.zst"
 CT_STORAGE="local-lvm" # Default storage for root disk
 CT_DISK_SIZE="32G"     # Default disk size for Immich
 CT_MEMORY="4096"       # 4GB RAM
@@ -40,9 +40,13 @@ CT_GATEWAY=""          # Required if CT_IP is static
 CT_VLAN=""             # VLAN tag, if applicable
 CT_PASSWORD=""         # Default password for the unprivileged user (will be generated if empty)
 CT_USERNAME="immich-user" # Default user for Immich LXC
+CT_SEARCHDOMAIN="" # Search domain for the LXC
+CT_NAMESERVER=""   # Nameserver for the LXC
 
 # Immich Specific Variables
 IMMICH_DIR="/opt/immich" # Directory where Immich will be cloned inside the CT
+CT_IMMICH_BIND_MOUNT_HOST_PATH="" # Host path for Immich data bind mount
+CT_IMMICH_BIND_MOUNT_CT_PATH="/mnt/immich_data" # CT path for Immich data bind mount
 
 # Script Execution Flags
 DEBUG="false" # Set to true for debug output
@@ -107,6 +111,10 @@ Options:
   -g, --gateway <IP>       Gateway IP address (required if --ip is set).
   -v, --vlan <ID>          VLAN tag for the network interface.
   -b, --bridge <BRIDGE>    Network bridge (default: ${CT_NETWORK_BRIDGE})
+  -x, --searchdomain <DOMAIN> Search domain for the LXC.
+  -n, --nameserver <IP>    Nameserver for the LXC.
+  -h, --host-path <PATH>   Proxmox host path for Immich data bind mount.
+  -t, --ct-path <PATH>     LXC container path for Immich data bind mount (default: ${CT_IMMICH_BIND_MOUNT_CT_PATH}).
   -D, --debug              Enable debug mode (prints verbose output).
   -f, --force              Force execution, bypass some prompts.
   -N, --non-interactive    Run without interactive prompts (requires all necessary options).
@@ -147,6 +155,9 @@ dependency_check() {
   msg "Checking for required dependencies..."
   if ! command -v getopt &>/dev/null; then
     err "The 'getopt' command is not found. Please install it (e.g., 'apt install util-linux')."
+  fi
+  if ! command -v jq &>/dev/null; then
+    err "The 'jq' command is not found. Please install it (e.g., 'apt install jq')."
   fi
 
   if [[ "$INTERACTIVE" == "true" ]]; then
@@ -298,6 +309,51 @@ install_immich() {
 
 # --- Interactive Menu Functions ---
 
+# Function to find next available mount point index
+find_next_mp_index() {
+  local lxc_id="$1"
+  local index=0
+  while pct config "$lxc_id" | grep -q "mp${index}:"; do
+    index=$((index + 1))
+  done
+  echo "$index"
+}
+
+# Function for post-CT creation configuration (pct set commands)
+post_ct_configuration() {
+  header "Post-LXC Creation Configuration (ID: ${CTID})"
+
+  if [[ -n "$CT_SEARCHDOMAIN" ]]; then
+    msg "Setting search domain to: ${CT_SEARCHDOMAIN}"
+    pct set "$CTID" --searchdomain "$CT_SEARCHDOMAIN" || warn "Failed to set search domain."
+  fi
+
+  if [[ -n "$CT_NAMESERVER" ]]; then
+    msg "Setting nameserver to: ${CT_NAMESERVER}"
+    pct set "$CTID" --nameserver "$CT_NAMESERVER" || warn "Failed to set nameserver."
+  fi
+
+  if [[ -n "$CT_IMMICH_BIND_MOUNT_HOST_PATH" && -n "$CT_IMMICH_BIND_MOUNT_CT_PATH" ]]; then
+    msg "Configuring bind mount for Immich data..."
+    # Ensure the host path exists
+    if [[ ! -d "$CT_IMMICH_BIND_MOUNT_HOST_PATH" ]]; then
+      msg "Creating host directory: ${CT_IMMICH_BIND_MOUNT_HOST_PATH}"
+      mkdir -p "$CT_IMMICH_BIND_MOUNT_HOST_PATH" || err "Failed to create host directory for bind mount."
+    fi
+
+    local mp_index
+    mp_index=$(find_next_mp_index "$CTID")
+    msg "Using mount point index: mp${mp_index}"
+    pct set "$CTID" --mp"${mp_index}" "${CT_IMMICH_BIND_MOUNT_HOST_PATH},mp=${CT_IMMICH_BIND_MOUNT_CT_PATH}" || err "Failed to configure bind mount."
+    msg "Bind mount configured: Host ${CT_IMMICH_BIND_MOUNT_HOST_PATH} -> CT ${CT_IMMICH_BIND_MOUNT_CT_PATH}"
+
+    # Also create the mount point inside the container and set ownership
+    exec_in_ct "mkdir -p ${CT_IMMICH_BIND_MOUNT_CT_PATH}"
+    exec_in_ct "chown ${CT_USERNAME}:${CT_USERNAME} ${CT_IMMICH_BIND_MOUNT_CT_PATH}"
+  fi
+}
+
+
 # Function to display and get input for LXC configuration
 configure_lxc_settings() {
   header "Configure LXC Settings"
@@ -362,6 +418,12 @@ configure_lxc_settings() {
     CT_VLAN=""
   fi
 
+  # Search Domain
+  CT_SEARCHDOMAIN=$(whiptail --inputbox "Enter Search Domain (optional, e.g., yourdomain.com):" 10 60 "$CT_SEARCHDOMAIN" 3>&1 1>&2 2>&3) || return 1
+
+  # Nameserver
+  CT_NAMESERVER=$(whiptail --inputbox "Enter Nameserver (optional, e.g., 8.8.8.8 or leave empty for host's):" 10 60 "$CT_NAMESERVER" 3>&1 1>&2 2>&3) || return 1
+
   # Password
   if (whiptail --yesno "Set a custom password for LXC user '${CT_USERNAME}'?" 10 60 --defaultno); then
     CT_PASSWORD=$(whiptail --passwordbox "Enter Password:" 10 60 3>&1 1>&2 2>&3) || return 1
@@ -373,6 +435,16 @@ configure_lxc_settings() {
     fi
   else
     CT_PASSWORD="" # Will be auto-generated if left empty
+  fi
+
+  # Bind Mount for Immich Data
+  if (whiptail --yesno "Configure a bind mount for Immich data (highly recommended for persistent storage)?" 10 78 --defaultyes); then
+    whiptail --msgbox "This will create a directory on your Proxmox host and mount it inside the LXC container. This is where Immich will store your photos and videos, making them persistent even if the LXC is re-created." 12 78
+    CT_IMMICH_BIND_MOUNT_HOST_PATH=$(whiptail --inputbox "Enter Proxmox Host Path for Immich Data (e.g., /mnt/pve/your_storage/immich_data):" 10 78 "$CT_IMMICH_BIND_MOUNT_HOST_PATH" 3>&1 1>&2 2>&3) || return 1
+    CT_IMMICH_BIND_MOUNT_CT_PATH=$(whiptail --inputbox "Enter LXC Container Path for Immich Data (e.g., /mnt/immich_data):" 10 78 "$CT_IMMICH_BIND_MOUNT_CT_PATH" 3>&1 1>&2 2>&3) || return 1
+  else
+    CT_IMMICH_BIND_MOUNT_HOST_PATH=""
+    CT_IMMICH_BIND_MOUNT_CT_PATH=""
   fi
 
   return 0 # Indicate success
@@ -398,9 +470,13 @@ Network Bridge: ${CT_NETWORK_BRIDGE}
 IP Address: ${CT_IP:-DHCP}
 Gateway: ${CT_GATEWAY:-N/A}
 VLAN Tag: ${CT_VLAN:-N/A}
+Search Domain: ${CT_SEARCHDOMAIN:-N/A}
+Nameservers: ${CT_NAMESERVER:-Host Default}
 LXC Username: ${CT_USERNAME}
 Password: ${CT_PASSWORD:+Set (hidden)}
 Immich Install Dir: ${IMMICH_DIR}
+Immich Data Bind Mount (Host): ${CT_IMMICH_BIND_MOUNT_HOST_PATH:-None}
+Immich Data Bind Mount (LXC): ${CT_IMMICH_BIND_MOUNT_CT_PATH:-None}
 "
   whiptail --msgbox "$settings_text" 25 78
 }
@@ -434,6 +510,7 @@ main_menu() {
           download_lxc_template
           create_ct
           start_ct
+          post_ct_configuration # Call post-creation config here
           install_immich
           # Post-installation summary
           header "Immich LXC Deployment Complete!"
@@ -487,7 +564,7 @@ main() {
 
   # Parse command line arguments
   local PARSED_OPTIONS
-  PARSED_OPTIONS=$(getopt -o i:H:s:d:m:c:up:I:g:v:b:DfhN --long ctid:,hostname:,storage:,disk-size:,memory:,cores:,unprivileged,password:,ip:,gateway:,vlan:,bridge:,debug,force,help,non-interactive -n "${SCRIPT_NAME}" -- "$@")
+  PARSED_OPTIONS=$(getopt -o i:H:s:d:m:c:up:I:g:v:b:x:n:h:t:DfhN --long ctid:,hostname:,storage:,disk-size:,memory:,cores:,unprivileged,password:,ip:,gateway:,vlan:,bridge:,searchdomain:,nameserver:,host-path:,ct-path:,debug,force,help,non-interactive -n "${SCRIPT_NAME}" -- "$@")
 
   if [[ $? -ne 0 ]]; then
     err "Failed to parse options. Use --help for usage."
@@ -545,6 +622,22 @@ main() {
       CT_NETWORK_BRIDGE="$2"
       shift 2
       ;;
+    -x | --searchdomain)
+      CT_SEARCHDOMAIN="$2"
+      shift 2
+      ;;
+    -n | --nameserver)
+      CT_NAMESERVER="$2"
+      shift 2
+      ;;
+    -h | --host-path)
+      CT_IMMICH_BIND_MOUNT_HOST_PATH="$2"
+      shift 2
+      ;;
+    -t | --ct-path)
+      CT_IMMICH_BIND_MOUNT_CT_PATH="$2"
+      shift 2
+      ;;
     -D | --debug)
       DEBUG="true"
       set -x # Enable xtrace for debug output
@@ -573,7 +666,7 @@ main() {
 
   # Pre-checks
   pve_check
-  dependency_check # Check for whiptail here
+  dependency_check # Check for whiptail and jq here
   arch_check
 
   # If not running interactively, proceed directly with installation
@@ -591,6 +684,7 @@ main() {
     download_lxc_template
     create_ct
     start_ct
+    post_ct_configuration # Call post-creation config here
     install_immich
     # Post-installation summary for non-interactive mode
     header "Immich LXC Deployment Complete!"
@@ -605,27 +699,27 @@ main() {
         final_ip=$(pct exec "$CTID" -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
         if [[ -n "$final_ip" ]]; then
           break
+        F
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+
+        if [[ -z "$final_ip" ]]; then
+          warn "Could not automatically retrieve IP address. You may need to check it manually using 'pct exec ${CTID} -- ip a'."
+          final_ip="<LXC_IP_ADDRESS>"
         fi
-        sleep 5
-        attempt=$((attempt + 1))
-      done
-
-      if [[ -z "$final_ip" ]]; then
-        warn "Could not automatically retrieve IP address. You may need to check it manually using 'pct exec ${CTID} -- ip a'."
-        final_ip="<LXC_IP_ADDRESS>"
       fi
+      msg "Immich LXC Container ID: ${CTID}"
+      msg "Hostname: ${CT_HOSTNAME}"
+      msg "LXC Username: ${CT_USERNAME}"
+      msg "Access Immich at: http://${final_ip}:2283"
+      msg "For further configuration, connect to the LXC and navigate to ${IMMICH_DIR}."
+      msg "Consider setting up a bind mount for your Immich library outside the CT for persistent storage."
+    else
+      # Run interactive menu
+      main_menu
     fi
-    msg "Immich LXC Container ID: ${CTID}"
-    msg "Hostname: ${CT_HOSTNAME}"
-    msg "LXC Username: ${CT_USERNAME}"
-    msg "Access Immich at: http://${final_ip}:2283"
-    msg "For further configuration, connect to the LXC and navigate to ${IMMICH_DIR}."
-    msg "Consider setting up a bind mount for your Immich library outside the CT for persistent storage."
-  else
-    # Run interactive menu
-    main_menu
-  fi
-}
+  }
 
-# Run the main function
-main "$@"
+  # Run the main function
+  main "$@"

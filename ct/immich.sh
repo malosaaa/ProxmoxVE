@@ -3,6 +3,7 @@
 # This script automates the creation and configuration of an Immich LXC container
 # on Proxmox VE. It sets up a Debian 12 (Bookworm) LXC, installs Docker and
 # Docker Compose, and then deploys Immich using its official Docker Compose setup.
+# This version includes an interactive menu for easier configuration.
 
 # Strict mode: Exit immediately if a command exits with a non-zero status.
 set -o errexit
@@ -46,6 +47,7 @@ IMMICH_DIR="/opt/immich" # Directory where Immich will be cloned inside the CT
 # Script Execution Flags
 DEBUG="false" # Set to true for debug output
 FORCE="false" # Set to true to bypass some interactive prompts
+INTERACTIVE="true" # Set to false if running non-interactively (e.g., via CLI args only)
 
 # --- Utility Functions ---
 
@@ -57,7 +59,7 @@ header() {
 
 # Function to print informational messages
 msg() {
-  printf "\n%s\n" "$1"
+  printf "\n\e[32m[INFO]\e[0m %s\n" "$1"
 }
 
 # Function to print warning messages
@@ -86,6 +88,7 @@ usage() {
   header "Usage"
   cat <<EOF
 This script creates and configures an Immich LXC container on Proxmox.
+It can be run interactively or non-interactively using command-line options.
 
 Usage: ${SCRIPT_NAME} [OPTIONS]
 
@@ -106,6 +109,7 @@ Options:
   -b, --bridge <BRIDGE>    Network bridge (default: ${CT_NETWORK_BRIDGE})
   -D, --debug              Enable debug mode (prints verbose output).
   -f, --force              Force execution, bypass some prompts.
+  -N, --non-interactive    Run without interactive prompts (requires all necessary options).
   -h, --help               Display this help message and exit.
 EOF
   exit 0
@@ -127,11 +131,12 @@ arch_check() {
   if [[ "$detected_arch" != "$CT_ARCHITECTURE" ]]; then
     warn "Detected architecture ($detected_arch) does not match target architecture ($CT_ARCHITECTURE)."
     warn "This script is primarily tested on $CT_ARCHITECTURE. Proceed with caution."
-    if [[ "$FORCE" != "true" ]]; then
-      read -r -p "Do you want to continue? (y/N): " response
-      if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        err "Architecture mismatch. Exiting."
-      fi
+    if [[ "$FORCE" != "true" && "$INTERACTIVE" == "true" ]]; then
+      whiptail --title "Architecture Mismatch" --yesno \
+        "Detected architecture ($detected_arch) does not match target architecture ($CT_ARCHITECTURE).\n\nContinue anyway?" \
+        10 60 --defaultno || err "Architecture mismatch. Exiting."
+    elif [[ "$FORCE" != "true" && "$INTERACTIVE" == "false" ]]; then
+      err "Architecture mismatch detected in non-interactive mode. Use --force to override."
     fi
   fi
   msg "Architecture check passed."
@@ -143,7 +148,15 @@ dependency_check() {
   if ! command -v getopt &>/dev/null; then
     err "The 'getopt' command is not found. Please install it (e.g., 'apt install util-linux')."
   fi
-  msg "All required dependencies are present."
+
+  if [[ "$INTERACTIVE" == "true" ]]; then
+    if ! command -v whiptail &>/dev/null; then
+      warn "The 'whiptail' command is not found."
+      warn "Interactive menu will not be available. Please install 'whiptail' (apt install whiptail) or use command-line arguments."
+      INTERACTIVE="false"
+    fi
+  fi
+  msg "All required dependencies are present (or handled)."
 }
 
 # Function to find the next available CTID
@@ -283,13 +296,198 @@ install_immich() {
   msg "Immich installation complete!"
 }
 
+# --- Interactive Menu Functions ---
+
+# Function to display and get input for LXC configuration
+configure_lxc_settings() {
+  header "Configure LXC Settings"
+
+  # CTID
+  local current_ctid="${CTID}"
+  if [[ -z "$current_ctid" ]]; then
+    find_next_ctid # Find a default if not set by CLI
+    current_ctid="$CTID"
+  fi
+  CTID=$(whiptail --inputbox "Enter Container ID:" 10 60 "$current_ctid" 3>&1 1>&2 2>&3) || return 1
+
+  # Hostname
+  CT_HOSTNAME=$(whiptail --inputbox "Enter Hostname:" 10 60 "$CT_HOSTNAME" 3>&1 1>&2 2>&3) || return 1
+
+  # Storage
+  local available_storages
+  available_storages=$(pvesm status -content rootdir -format json | jq -r '.[].name')
+  if [[ -z "$available_storages" ]]; then
+      warn "No rootdir storage found. Please ensure you have storage configured for root directories."
+      CT_STORAGE=$(whiptail --inputbox "Enter Storage (e.g., local-lvm):" 10 60 "$CT_STORAGE" 3>&1 1>&2 2>&3) || return 1
+  else
+      local storage_options=()
+      while IFS= read -r line; do
+          storage_options+=("$line" "")
+      done <<< "$available_storages"
+      CT_STORAGE=$(whiptail --menu "Select Storage:" 15 60 5 "${storage_options[@]}" 3>&1 1>&2 2>&3) || return 1
+  fi
+
+  # Disk Size
+  CT_DISK_SIZE=$(whiptail --inputbox "Enter Disk Size (e.g., 32G, 64G):" 10 60 "$CT_DISK_SIZE" 3>&1 1>&2 2>&3) || return 1
+
+  # Memory
+  CT_MEMORY=$(whiptail --inputbox "Enter Memory in MB:" 10 60 "$CT_MEMORY" 3>&1 1>&2 2>&3) || return 1
+
+  # Cores
+  CT_CORES=$(whiptail --inputbox "Enter Number of CPU Cores:" 10 60 "$CT_CORES" 3>&1 1>&2 2>&3) || return 1
+
+  # Unprivileged
+  if (whiptail --yesno "Create Unprivileged Container?" 10 60 --defaultyes); then
+    CT_UNPRIVILEGED="yes"
+  else
+    CT_UNPRIVILEGED="no"
+  fi
+
+  # Network Bridge
+  CT_NETWORK_BRIDGE=$(whiptail --inputbox "Enter Network Bridge (e.g., vmbr0):" 10 60 "$CT_NETWORK_BRIDGE" 3>&1 1>&2 2>&3) || return 1
+
+  # IP Configuration
+  if (whiptail --yesno "Use Static IP Address?" 10 60 --defaultno); then
+    CT_IP=$(whiptail --inputbox "Enter Static IP/CIDR (e.g., 192.168.1.10/24):" 10 60 "$CT_IP" 3>&1 1>&2 2>&3) || return 1
+    CT_GATEWAY=$(whiptail --inputbox "Enter Gateway IP:" 10 60 "$CT_GATEWAY" 3>&1 1>&2 2>&3) || return 1
+  else
+    CT_IP=""
+    CT_GATEWAY=""
+  fi
+
+  # VLAN
+  if (whiptail --yesno "Use VLAN Tag?" 10 60 --defaultno); then
+    CT_VLAN=$(whiptail --inputbox "Enter VLAN ID:" 10 60 "$CT_VLAN" 3>&1 1>&2 2>&3) || return 1
+  else
+    CT_VLAN=""
+  fi
+
+  # Password
+  if (whiptail --yesno "Set a custom password for LXC user '${CT_USERNAME}'?" 10 60 --defaultno); then
+    CT_PASSWORD=$(whiptail --passwordbox "Enter Password:" 10 60 3>&1 1>&2 2>&3) || return 1
+    local confirm_password
+    confirm_password=$(whiptail --passwordbox "Confirm Password:" 10 60 3>&1 1>&2 2>&3) || return 1
+    if [[ "$CT_PASSWORD" != "$confirm_password" ]]; then
+      whiptail --msgbox "Passwords do not match! Please try again." 10 60
+      return 1 # Indicate failure to re-enter settings
+    fi
+  else
+    CT_PASSWORD="" # Will be auto-generated if left empty
+  fi
+
+  return 0 # Indicate success
+}
+
+# Function to display current settings for review
+review_settings() {
+  header "Current LXC Settings for Immich"
+  local settings_text="
+Container ID: ${CTID}
+Hostname: ${CT_HOSTNAME}
+Description: ${CT_DESCRIPTION}
+OS Type: ${CT_OS_TYPE} ${CT_OS_VERSION}
+Architecture: ${CT_ARCHITECTURE}
+Storage: ${CT_STORAGE}
+Disk Size: ${CT_DISK_SIZE}
+Memory: ${CT_MEMORY}MB
+Swap: ${CT_SWAP}MB
+Cores: ${CT_CORES}
+Unprivileged: ${CT_UNPRIVILEGED}
+Features: ${CT_FEATURES}
+Network Bridge: ${CT_NETWORK_BRIDGE}
+IP Address: ${CT_IP:-DHCP}
+Gateway: ${CT_GATEWAY:-N/A}
+VLAN Tag: ${CT_VLAN:-N/A}
+LXC Username: ${CT_USERNAME}
+Password: ${CT_PASSWORD:+Set (hidden)}
+Immich Install Dir: ${IMMICH_DIR}
+"
+  whiptail --msgbox "$settings_text" 25 78
+}
+
+# Function to handle the main menu
+main_menu() {
+  while true; do
+    local choice
+    choice=$(whiptail --title "Immich LXC Installer" --menu "Choose an option:" 20 78 10 \
+      "1" "Install Immich LXC" \
+      "2" "Configure LXC Settings" \
+      "3" "Review Current Settings" \
+      "4" "Help / Usage" \
+      "5" "Exit" 3>&1 1>&2 2>&3)
+
+    case "$choice" in
+      1) # Install Immich LXC
+        review_settings
+        if (whiptail --title "Confirm Installation" --yesno "Proceed with Immich LXC installation using the above settings?" 10 60 --defaultno); then
+          # Pre-validation before starting
+          if [[ -z "$CTID" ]]; then
+            find_next_ctid
+          fi
+          if pct status "$CTID" &>/dev/null; then
+            if [[ "$FORCE" != "true" ]]; then
+              whiptail --title "Container Exists" --yesno "Container ID ${CTID} already exists.\n\nDo you want to overwrite it? This will destroy the existing container!" 10 60 --defaultno || continue
+            fi
+            msg "Destroying existing container ${CTID}..."
+            pct destroy "$CTID" --force || warn "Failed to destroy existing container ${CTID}. Proceeding anyway, but this might cause issues."
+          fi
+          download_lxc_template
+          create_ct
+          start_ct
+          install_immich
+          # Post-installation summary
+          header "Immich LXC Deployment Complete!"
+          local final_ip
+          if [[ -n "$CT_IP" ]]; then
+            final_ip=$(echo "$CT_IP" | cut -d'/' -f1)
+          else
+            msg "Attempting to retrieve DHCP assigned IP for ${CTID}..."
+            local max_attempts=10
+            local attempt=0
+            while [[ "$attempt" -lt "$max_attempts" ]]; do
+              final_ip=$(pct exec "$CTID" -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+              if [[ -n "$final_ip" ]]; then
+                break
+              fi
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+
+            if [[ -z "$final_ip" ]]; then
+              warn "Could not automatically retrieve IP address. You may need to check it manually using 'pct exec ${CTID} -- ip a'."
+              final_ip="<LXC_IP_ADDRESS>"
+            fi
+          fi
+          whiptail --msgbox "Immich LXC Container ID: ${CTID}\nHostname: ${CT_HOSTNAME}\nLXC Username: ${CT_USERNAME}\nPassword: ${CT_PASSWORD:+Set (hidden)}\n\nAccess Immich at: http://${final_ip}:2283\n\nYou can also access the LXC via SSH: ssh ${CT_USERNAME}@${final_ip}\n\nRemember to configure your reverse proxy and SSL if you plan to expose Immich to the internet." 25 78
+          exit 0
+        fi
+        ;;
+      2) # Configure LXC Settings
+        configure_lxc_settings || whiptail --msgbox "Configuration cancelled or failed. Please re-enter." 10 60
+        ;;
+      3) # Review Current Settings
+        review_settings
+        ;;
+      4) # Help / Usage
+        usage
+        ;;
+      5) # Exit
+        exit 0
+        ;;
+      *) # User pressed ESC or cancelled
+        exit 0
+        ;;
+    esac
+  done
+}
+
 # --- Main Script Logic ---
 main() {
   header "Starting Immich LXC Deployment"
 
   # Parse command line arguments
   local PARSED_OPTIONS
-  PARSED_OPTIONS=$(getopt -o i:H:s:d:m:c:up:I:g:v:b:Dfh --long ctid:,hostname:,storage:,disk-size:,memory:,cores:,unprivileged,password:,ip:,gateway:,vlan:,bridge:,debug,force,help -n "${SCRIPT_NAME}" -- "$@")
+  PARSED_OPTIONS=$(getopt -o i:H:s:d:m:c:up:I:g:v:b:DfhN --long ctid:,hostname:,storage:,disk-size:,memory:,cores:,unprivileged,password:,ip:,gateway:,vlan:,bridge:,debug,force,help,non-interactive -n "${SCRIPT_NAME}" -- "$@")
 
   if [[ $? -ne 0 ]]; then
     err "Failed to parse options. Use --help for usage."
@@ -356,6 +554,10 @@ main() {
       FORCE="true"
       shift
       ;;
+    -N | --non-interactive)
+      INTERACTIVE="false"
+      shift
+      ;;
     -h | --help)
       usage
       ;;
@@ -371,74 +573,58 @@ main() {
 
   # Pre-checks
   pve_check
+  dependency_check # Check for whiptail here
   arch_check
-  dependency_check
 
-  # Find CTID if not provided
-  if [[ -z "$CTID" ]]; then
-    find_next_ctid
-  fi
+  # If not running interactively, proceed directly with installation
+  if [[ "$INTERACTIVE" == "false" ]]; then
+    if [[ -z "$CTID" ]]; then
+      find_next_ctid
+    fi
+    if pct status "$CTID" &>/dev/null; then
+      if [[ "$FORCE" != "true" ]]; then
+        err "Container ID ${CTID} already exists. Use --force to overwrite in non-interactive mode."
+      fi
+      msg "Destroying existing container ${CTID}..."
+      pct destroy "$CTID" --force || warn "Failed to destroy existing container ${CTID}. Proceeding anyway, but this might cause issues."
+    fi
+    download_lxc_template
+    create_ct
+    start_ct
+    install_immich
+    # Post-installation summary for non-interactive mode
+    header "Immich LXC Deployment Complete!"
+    local final_ip
+    if [[ -n "$CT_IP" ]]; then
+      final_ip=$(echo "$CT_IP" | cut -d'/' -f1)
+    else
+      msg "Attempting to retrieve DHCP assigned IP for ${CTID}..."
+      local max_attempts=10
+      local attempt=0
+      while [[ "$attempt" -lt "$max_attempts" ]]; do
+        final_ip=$(pct exec "$CTID" -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$final_ip" ]]; then
+          break
+        fi
+        sleep 5
+        attempt=$((attempt + 1))
+      done
 
-  # Validate CTID
-  if pct status "$CTID" &>/dev/null; then
-    warn "Container ID ${CTID} already exists."
-    if [[ "$FORCE" != "true" ]]; then
-      read -r -p "Do you want to overwrite it? This will destroy the existing container! (y/N): " response
-      if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        err "Container ID ${CTID} exists. Exiting."
+      if [[ -z "$final_ip" ]]; then
+        warn "Could not automatically retrieve IP address. You may need to check it manually using 'pct exec ${CTID} -- ip a'."
+        final_ip="<LXC_IP_ADDRESS>"
       fi
     fi
-    msg "Destroying existing container ${CTID}..."
-    pct destroy "$CTID" --force || warn "Failed to destroy existing container ${CTID}. Proceeding anyway, but this might cause issues."
-  fi
-
-  # Download template if not present
-  download_lxc_template
-
-  # Create, start, and install Immich
-  create_ct
-  start_ct
-  install_immich
-
-  # Post-installation summary
-  header "Immich LXC Deployment Complete!"
-  msg "Immich LXC Container ID: ${CTID}"
-  msg "Hostname: ${CT_HOSTNAME}"
-  msg "LXC Username: ${CT_USERNAME}"
-  if [[ -n "$CT_PASSWORD" ]]; then
-    msg "LXC Password (for ${CT_USERNAME}): ${CT_PASSWORD}"
+    msg "Immich LXC Container ID: ${CTID}"
+    msg "Hostname: ${CT_HOSTNAME}"
+    msg "LXC Username: ${CT_USERNAME}"
+    msg "Access Immich at: http://${final_ip}:2283"
+    msg "For further configuration, connect to the LXC and navigate to ${IMMICH_DIR}."
+    msg "Consider setting up a bind mount for your Immich library outside the CT for persistent storage."
   else
-    msg "LXC Password was not set via --password. You can set it manually via 'pct set ${CTID} --password <YOUR_PASSWORD>'."
+    # Run interactive menu
+    main_menu
   fi
-
-  local final_ip
-  if [[ -n "$CT_IP" ]]; then
-    final_ip=$(echo "$CT_IP" | cut -d'/' -f1)
-  else
-    msg "Attempting to retrieve DHCP assigned IP for ${CTID}..."
-    # Loop to wait for IP to be assigned via DHCP
-    local max_attempts=10
-    local attempt=0
-    while [[ "$attempt" -lt "$max_attempts" ]]; do
-      final_ip=$(pct exec "$CTID" -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-      if [[ -n "$final_ip" ]]; then
-        break
-      fi
-      sleep 5
-      attempt=$((attempt + 1))
-    done
-
-    if [[ -z "$final_ip" ]]; then
-      warn "Could not automatically retrieve IP address. You may need to check it manually using 'pct exec ${CTID} -- ip a'."
-      final_ip="<LXC_IP_ADDRESS>"
-    fi
-  fi
-
-  msg "Access Immich at: http://${final_ip}:2283"
-  msg "You can also access the LXC via SSH: ssh ${CT_USERNAME}@${final_ip}"
-  msg "Remember to configure your reverse proxy and SSL if you plan to expose Immich to the internet."
-  msg "For further configuration, connect to the LXC and navigate to ${IMMICH_DIR}."
-  msg "Consider setting up a bind mount for your Immich library outside the CT for persistent storage."
 }
 
 # Run the main function

@@ -19,9 +19,9 @@ source <(curl -s https://raw.githubusercontent.com/tteck/Proxmox/main/misc/build
 function header_info {
   clear
   cat <<"EOF"
-  _____                     _   
- |_   _|                   | |  
-   | |  _ __ ___  _ __ ___   ___| |__ 
+  _____            _   
+ |_   _|          | |  
+   | |  _ __ ___  _ __ ___  ___| |__ 
    | | | '_ ` _ \ | '_ ` _ \ / __| '_ \
   _| |_| | | | | || | | | | | (__| | | |
  |_____|_| |_| |_||_| |_| |_|\___|_| |_|
@@ -94,16 +94,18 @@ start # From build.func - this will handle user input for basic/advanced setup
 # Build the container
 build_container # From build.func
 
+# Generate a random PostgreSQL password outside the pct exec for easier quoting
+IMMICH_DB_PASSWORD=$(openssl rand -base64 32)
+
 # Install Immich inside the container
 msg_info "Preparing to install ${APP} in LXC ID ${CTID}..."
 msg_info "This process will take a significant amount of time (15-45+ minutes depending on system and network speed)."
 
 # Commands to install Docker and Immich inside the LXC
-# These commands are adapted from the original `immich.sh` and Immich documentation
 pct exec $CTID -- bash -c "
   # Update and install dependencies
   apt-get update -qqy
-  apt-get install -qqy --no-install-recommends curl git ca-certificates gnupg lsb-release
+  apt-get install -qqy --no-install-recommends curl git ca-certificates gnupg lsb-release openssl
 
   # Install Docker
   install -m 0755 -d /etc/apt/keyrings
@@ -114,16 +116,23 @@ pct exec $CTID -- bash -c "
   apt-get install -qqy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
   # Prepare Immich directory
-  mkdir -p /opt/immich
+  mkdir -p /opt/immich/data/photos /opt/immich/data/db # Create necessary subdirectories for volumes
   cd /opt/immich
 
   # Download Immich Docker Compose files
   curl -sSL https://raw.githubusercontent.com/immich-app/immich/main/docker/docker-compose.yml -o docker-compose.yml
   curl -sSL https://raw.githubusercontent.com/immich-app/immich/main/docker/.env.example -o .env
 
-  # Generate a random PostgreSQL password
-  DB_PASSWORD=\$(openssl rand -base64 32)
-  sed -i \"s|DB_PASSWORD=immich|DB_PASSWORD=\$DB_PASSWORD|\" .env
+  # Configure the .env file with essential variables
+  # Using a temporary file and awk for robust multi-line replacement
+  temp_env_file=\$(mktemp)
+  awk -v db_pass='${IMMICH_DB_PASSWORD}' '
+    /^#UPLOAD_LOCATION=/ { print \"UPLOAD_LOCATION=/usr/src/app/upload\" }
+    /^#DB_DATA_LOCATION=/ { print \"DB_DATA_LOCATION=/usr/src/app/pgdata\" }
+    /^DB_PASSWORD=immich/ { print \"DB_PASSWORD=\" db_pass }
+    !/^#UPLOAD_LOCATION=/ && !/^#DB_DATA_LOCATION=/ && !/^DB_PASSWORD=immich/ { print }
+  ' .env > \"\$temp_env_file\"
+  mv \"\$temp_env_file\" .env
 
   # Start Immich containers
   docker compose up -d

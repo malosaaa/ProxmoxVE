@@ -101,7 +101,7 @@ build_container # From build.func
 # For a real scenario, you'd upload the immich-install.sh content (from the next immersive block)
 # to a raw gist URL or similar.
 # Example: INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/yourusername/yourrepo/main/immich-install.sh"
-INSTALL_SCRIPT_URL="https://gist.githubusercontent.com/malosaaa/ProxmoxVE/raw/immich.sh" # REPLACE THIS
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/malosaaa/ProxmoxVE/refs/heads/main/ct/immich.sh" # REPLACE THIS
 # For testing, you can manually create the install script inside the container and run it.
 
 # Message to the user about replacing the URL
